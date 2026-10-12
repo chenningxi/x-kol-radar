@@ -1,0 +1,19 @@
+.DS_Store
+.agents/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+data/*.tmp
+
+# Runtime state and private data
+data/*.jsonl
+data/x_cursors.json
+data/x_profiles.md
+data/.x-kol-sync.lock
+logs/
+
+# Local screenshots and generated artifacts
+*.png
+*.jpg
+*.jpeg

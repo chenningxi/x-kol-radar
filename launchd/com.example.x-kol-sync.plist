@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.x-kol-sync</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/ABSOLUTE/PATH/TO/x-kol-monitor/scripts/run_x_kol_sync_launchd.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/ABSOLUTE/PATH/TO/x-kol-monitor</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>X_KOL_WORKSPACE</key>
+		<string>/ABSOLUTE/PATH/TO/x-kol-monitor</string>
+		<key>X_KOL_PYTHON</key>
+		<string>/usr/bin/python3</string>
+		<key>X_KOL_OPENCLI</key>
+		<string>opencli</string>
+		<key>X_KOL_PATH</key>
+		<string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/ABSOLUTE/PATH/TO/x-kol-monitor/logs/launchd.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/ABSOLUTE/PATH/TO/x-kol-monitor/logs/launchd.stderr.log</string>
+</dict>
+</plist>
