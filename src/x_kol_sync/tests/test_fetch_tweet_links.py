@@ -1,4 +1,5 @@
 import importlib.util
+import csv
 import io
 import json
 import pathlib
@@ -42,6 +43,80 @@ class NormalizeProfileTests(unittest.TestCase):
 
 
 class RecordPreparationTests(unittest.TestCase):
+    def test_preserves_quote_identity_and_text_separately(self):
+        item = {
+            "id": "123",
+            "author": "Creator",
+            "text": "Important!",
+            "quoted_tweet": {
+                "url": "https://twitter.com/Source/status/100?s=20",
+                "name": "Source Team",
+                "text": "A new product launches today.",
+                "created_at": "Mon Jan 01 00:00:00 +0000 2024",
+                "has_media": True,
+                "quoted_tweet": {"text": "Do not recursively expand this"},
+            },
+        }
+
+        records = MODULE.prepare_records([item], "Creator", include_retweets=False)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["text"], "Important!")
+        self.assertEqual(records[0]["author"], "creator")
+        self.assertEqual(records[0]["quote_status"], "available")
+        quote = records[0]["quoted_tweet"]
+        self.assertEqual(quote["id"], "100")
+        self.assertEqual(quote["author"], "source")
+        self.assertEqual(quote["url"], "https://x.com/source/status/100")
+        self.assertEqual(quote["text"], "A new product launches today.")
+        self.assertTrue(quote["has_media"])
+        self.assertNotIn("quoted_tweet", quote)
+
+    def test_quote_id_without_author_never_inherits_outer_author(self):
+        items = [{"id": "123", "author": "Creator", "quoted_tweet": {"id": "100", "text": "x"}}]
+
+        record = MODULE.prepare_records(items, "Creator", False)[0]
+
+        self.assertEqual(record["quote_status"], "unavailable")
+        self.assertNotIn("quoted_tweet", record)
+
+    def test_self_quote_and_malformed_quote_are_unavailable(self):
+        for quote in ({"url": "https://x.com/creator/status/123"}, "bad", {}):
+            with self.subTest(quote=quote):
+                record = MODULE.prepare_records(
+                    [{"id": "123", "author": "creator", "quoted_tweet": quote}], "creator", False
+                )[0]
+                self.assertEqual(record["quote_status"], "unavailable")
+                self.assertNotIn("quoted_tweet", record)
+
+    def test_explicit_quote_flag_without_detail_is_unavailable(self):
+        record = MODULE.prepare_records(
+            [{"id": "123", "author": "creator", "is_quote_status": True}], "creator", False
+        )[0]
+
+        self.assertEqual(record["quote_status"], "unavailable")
+
+    def test_short_link_or_null_quote_does_not_prove_quote(self):
+        record = MODULE.prepare_records(
+            [{"id": "123", "author": "creator", "text": "https://t.co/example", "quoted_tweet": None}],
+            "creator", False,
+        )[0]
+
+        self.assertNotIn("quoted_tweet", record)
+        self.assertNotIn("quote_status", record)
+
+    def test_quote_object_is_json_in_csv_and_jsonl(self):
+        records = MODULE.prepare_records(
+            [{"id": "123", "author": "creator", "quoted_tweet": {"id": "100", "author": "source", "text": 'a, "b"\n第二行'}}],
+            "creator", False,
+        )
+
+        csv_row = next(csv.DictReader(io.StringIO(MODULE.render_records(records, "csv"))))
+        jsonl_row = json.loads(MODULE.render_records(records, "jsonl"))
+
+        self.assertEqual(json.loads(csv_row["quoted_tweet"]), records[0]["quoted_tweet"])
+        self.assertEqual(jsonl_row, records[0])
+
     def test_canonicalizes_deduplicates_and_excludes_retweets(self):
         items = [
             {

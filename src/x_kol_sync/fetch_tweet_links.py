@@ -51,6 +51,10 @@ OUTPUT_FIELDS = (
     "replies",
     "views",
     "url",
+    "name",
+    "has_media",
+    "quote_status",
+    "quoted_tweet",
 )
 
 
@@ -182,20 +186,44 @@ def prepare_records(
         if url in seen:
             continue
         seen.add(url)
-        records.append(
-            {
-                "profile": profile,
-                "id": post_id,
-                "author": author,
-                "created_at": item.get("created_at") or "",
-                "text": item.get("text") or "",
-                "likes": item.get("likes") or 0,
-                "retweets": item.get("retweets") or 0,
-                "replies": item.get("replies") or 0,
-                "views": item.get("views") or 0,
-                "url": url,
-            }
-        )
+        record = {
+            "profile": profile,
+            "id": post_id,
+            "author": author,
+            "created_at": item.get("created_at") or "",
+            "text": item.get("text") or "",
+            "likes": item.get("likes") or 0,
+            "retweets": item.get("retweets") or 0,
+            "replies": item.get("replies") or 0,
+            "views": item.get("views") or 0,
+            "url": url,
+        }
+        if isinstance(item.get("name"), str):
+            record["name"] = item["name"]
+        if "has_media" in item:
+            record["has_media"] = bool(item["has_media"])
+        raw_quote = item.get("quoted_tweet")
+        if isinstance(raw_quote, dict):
+            # Never use the outer author as a fallback for the quoted author.
+            quote_identity = canonical_post_url(raw_quote, "")
+            if quote_identity is not None and quote_identity[2] != post_id:
+                quote_url, quote_author, quote_id = quote_identity
+                record["quoted_tweet"] = {
+                    "id": quote_id,
+                    "author": quote_author,
+                    "name": str(raw_quote.get("name") or ""),
+                    "text": str(raw_quote.get("text") or ""),
+                    "created_at": str(raw_quote.get("created_at") or ""),
+                    "url": quote_url,
+                    "has_media": bool(raw_quote.get("has_media")),
+                }
+                record["quote_status"] = "available"
+            else:
+                record["quote_status"] = "unavailable"
+        elif raw_quote is not None or item.get("is_quote") or item.get("is_quote_status"):
+            record["quote_status"] = "unavailable"
+        # A null/absent quote from OpenCLI does not prove a quote exists.
+        records.append(record)
     return records
 
 
@@ -210,7 +238,11 @@ def render_records(records: list[dict[str, Any]], output_format: str) -> str:
         buffer = io.StringIO()
         writer = csv.DictWriter(buffer, fieldnames=OUTPUT_FIELDS)
         writer.writeheader()
-        writer.writerows(records)
+        for record in records:
+            csv_record = dict(record)
+            if isinstance(csv_record.get("quoted_tweet"), dict):
+                csv_record["quoted_tweet"] = json.dumps(csv_record["quoted_tweet"], ensure_ascii=False)
+            writer.writerow(csv_record)
         return buffer.getvalue()
     raise ValueError(f"Unsupported output format: {output_format}")
 

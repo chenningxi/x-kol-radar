@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Cursor-gated X sync plus idempotent Feishu dispatch ledger."""
+"""Cursor-gated X sync plus reviewed, idempotent Feishu dispatch."""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import argparse
+import hashlib
+import html
+import json
+import os
 import subprocess
 import sys
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -21,6 +22,10 @@ CHAT_ID = os.environ.get("X_KOL_FEISHU_CHAT_ID", "")
 PROFILE = os.environ.get("X_KOL_FEISHU_PROFILE", "")
 PYTHON = os.environ.get("X_KOL_PYTHON", sys.executable)
 WATCHLIST = WORKSPACE / "data/x_profiles.md"
+CONTENT_POLICY_VERSION = "v2"
+TRANSLATION_READY = {"translated", "not_needed", "no_translation_needed"}
+SEND_CLASSIFICATIONS = {"substantive", "uncertain"}
+SKIP_CLASSIFICATIONS = {"promotional", "low_signal"}
 
 
 def now() -> str:
@@ -57,10 +62,113 @@ def aliases() -> dict[str, str]:
     return result
 
 
-def main() -> int:
+def partition_dispatch_rows(
+    rows: list[dict],
+    sent_urls: set[str],
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Split unsent rows into send, skip, review, and translation queues."""
+    to_send: list[dict] = []
+    to_skip: list[dict] = []
+    awaiting_review: list[dict] = []
+    awaiting_translation: list[dict] = []
+
+    for row in rows:
+        if row.get("url") in sent_urls:
+            continue
+
+        classification = str(row.get("content_classification") or "").strip().lower()
+        policy_version = str(row.get("content_policy_version") or "").strip().lower()
+        if policy_version != CONTENT_POLICY_VERSION:
+            awaiting_review.append(row)
+        elif classification in SKIP_CLASSIFICATIONS:
+            to_skip.append(row)
+        elif classification in SEND_CLASSIFICATIONS:
+            quote = row.get("quoted_tweet")
+            quote_ready = (
+                not isinstance(quote, dict)
+                or not quote.get("text")
+                or quote.get("translation_status") in TRANSLATION_READY
+            )
+            if row.get("translation_status") in TRANSLATION_READY and quote_ready:
+                to_send.append(row)
+            else:
+                awaiting_translation.append(row)
+        else:
+            awaiting_review.append(row)
+
+    return to_send, to_skip, awaiting_review, awaiting_translation
+
+
+def append_skipped_rows(rows: list[dict]) -> None:
+    if not rows:
+        return
+    with SEND_LEDGER.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps({
+                "sent_at": now(),
+                "url": row.get("url"),
+                "profile": row.get("profile"),
+                "status": "skipped",
+                "message_id": None,
+                "chat_id": "",
+                "error": "",
+                "content_classification": row.get("content_classification"),
+                "content_reason": row.get("content_reason", ""),
+                "content_policy_version": row.get("content_policy_version"),
+            }, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def display_text(row: dict) -> str:
+    value = row.get("translation_zh") if row.get("translation_status") == "translated" else row.get("text")
+    text = " ".join(html.unescape(str(value or "")).split())
+    if len(text) > 500:
+        text = text[:500] + "…"
+    return text or ("（无文字正文，含媒体）" if row.get("has_media") else "（无文字正文）")
+
+
+def author_label(row: dict, alias_map: dict[str, str]) -> str:
+    author = str(row.get("author") or "").lstrip("@")
+    normalized_aliases = {key.rstrip("/").lower(): value for key, value in alias_map.items()}
+    name = normalized_aliases.get(f"https://x.com/{author.lower()}") or row.get("name")
+    if not name and row.get("profile"):
+        name = alias_map.get(row["profile"])
+    if author:
+        return f"{name}（@{author}）" if name else f"@{author}"
+    return str(name or "未知作者")
+
+
+def build_message(rows: list[dict], alias_map: dict[str, str]) -> str:
+    lines = [f"X KOL 新增推文 · {datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M')}", ""]
+    for row in rows:
+        lines.extend([
+            "━━━━━━━━━━━━",
+            f"【{author_label(row, alias_map)}】",
+            f"发布时间：{published_at(row)}",
+            "",
+            "作者发言（中文翻译）：" if row.get("translation_status") == "translated" else "作者发言：",
+            display_text(row),
+        ])
+        quote = row.get("quoted_tweet")
+        if isinstance(quote, dict):
+            lines.extend([
+                "",
+                f"引用推文｜{author_label(quote, alias_map)}",
+                f"引用发布时间：{published_at(quote)}",
+                "引用内容（中文翻译）：" if quote.get("translation_status") == "translated" else "引用内容：",
+                display_text(quote),
+                f"引用链接：{quote.get('url') or '不可用'}",
+            ])
+        elif row.get("quote_status") == "unavailable":
+            lines.extend(["", "引用推文：详情不可用（可能已删除、受限或未返回）"])
+        lines.extend(["", f"原文链接：{row.get('url')}"])
+    lines.append("━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("sync", "dispatch"), nargs="?", default="sync")
-    args = parser.parse_args()
+    parser.add_argument("mode", choices=("sync", "dispatch", "check"), nargs="?", default="sync")
+    args = parser.parse_args(argv)
 
     if args.mode == "sync":
         sync = subprocess.run([PYTHON, str(CURSOR_RUNNER)], cwd=WORKSPACE, text=True, capture_output=True, check=False)
@@ -68,6 +176,7 @@ def main() -> int:
         if sync.returncode:
             sys.stderr.write(sync.stderr)
             return sync.returncode
+        return 0
 
     after = read_rows(LEDGER)
     sent = read_rows(SEND_LEDGER)
@@ -75,15 +184,24 @@ def main() -> int:
         row.get("url") for row in sent
         if row.get("status") in {"sent", "skipped"}
     }
-    pending = [
-        row for row in after
-        if row.get("url") not in sent_urls
-        and row.get("translation_status") in {
-            "translated",
-            "not_needed",
-            "no_translation_needed",
-        }
-    ]
+
+    pending, skipped, awaiting_review, awaiting_translation = partition_dispatch_rows(after, sent_urls)
+    if args.mode == "check":
+        print(json.dumps({
+            "content_policy_version": CONTENT_POLICY_VERSION,
+            "send_ready": len(pending),
+            "skip_ready": len(skipped),
+            "awaiting_review": len(awaiting_review),
+            "awaiting_translation": len(awaiting_translation),
+        }, ensure_ascii=False))
+        return 1 if awaiting_review or awaiting_translation else 0
+    append_skipped_rows(skipped)
+    if skipped:
+        print(f"content_policy_skipped={len(skipped)}")
+    if awaiting_review:
+        print(f"content_policy_awaiting_review={len(awaiting_review)}")
+    if awaiting_translation:
+        print(f"content_policy_awaiting_translation={len(awaiting_translation)}")
     if not pending:
         return 0
 
@@ -95,25 +213,7 @@ def main() -> int:
         )
         return 2
 
-    alias_map = aliases()
-    lines = [f"X KOL 新增推文 · {datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M')}", ""]
-    for row in pending:
-        text_value = row.get("translation_zh") if row.get("translation_status") == "translated" else row.get("text")
-        text = " ".join(str(text_value or "").split())
-        if len(text) > 500:
-            text = text[:500] + "…"
-        alias = alias_map.get(row.get("profile"), row.get("author", ""))
-        lines.extend([
-            "━━━━━━━━━━━━",
-            f"【{alias}】",
-            f"发布时间：{published_at(row)}",
-            "",
-        ])
-        if row.get("translation_status") == "translated":
-            lines.append("中文翻译：")
-        lines.extend([text or "(无正文)", "", f"原文链接：{row.get('url')}"])
-    lines.append("━━━━━━━━━━━━")
-    message = "\n".join(lines)
+    message = build_message(pending, aliases())
     batch_key = hashlib.sha256("\n".join(sorted(row["url"] for row in pending)).encode()).hexdigest()[:40]
     command = [
         "lark-cli", "--profile", PROFILE, "im", "+messages-send",

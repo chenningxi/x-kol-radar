@@ -15,8 +15,11 @@ command -v python3 >/dev/null 2>&1 || {
   exit 1
 }
 
-python3 -m py_compile "$ROOT"/src/x_kol_sync/*.py "$ROOT"/scripts/*.py
-python3 "$ROOT/src/x_kol_sync/sync_x_kols.py" init --workspace "$ROOT"
+if [ ! -x "$ROOT/.venv/bin/python" ]; then
+  python3 -m venv "$ROOT/.venv"
+fi
+"$ROOT/.venv/bin/python" -m pip install -r "$ROOT/requirements.txt"
+"$ROOT/.venv/bin/python" -m py_compile "$ROOT"/src/x_kol_sync/*.py "$ROOT"/scripts/*.py
 
 if command -v opencli >/dev/null 2>&1; then
   echo "opencli: found"
@@ -30,4 +33,4 @@ else
   echo "lark-cli: not found (install/configure it before Feishu dispatch)"
 fi
 
-echo "Setup complete: $ROOT"
+echo "Setup complete. Configure .env, then run scripts/run_x_kol_db.py init and profiles."

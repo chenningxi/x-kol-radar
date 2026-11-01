@@ -159,6 +159,31 @@ class SynchronizationTests(unittest.TestCase):
         )
 
     @mock.patch.object(MODULE, "run_fetch")
+    def test_quote_context_survives_sync_and_url_dedup(self, run_fetch):
+        quote = {
+            "author": "source",
+            "text": "Product launch",
+            "url": "https://x.com/source/status/100",
+        }
+        run_fetch.return_value = [{
+            "id": "101",
+            "url": "https://x.com/creator/status/101",
+            "text": "Important",
+            "quoted_tweet": quote,
+            "quote_status": "available",
+        }]
+
+        first, first_code = MODULE.synchronize(self.sync_args())
+        second, second_code = MODULE.synchronize(self.sync_args())
+        saved = MODULE.workspace_paths(self.workspace)["ledger"].read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual((first_code, second_code), (0, 0))
+        self.assertEqual(first["totals"]["added"], 1)
+        self.assertEqual(second["totals"]["added"], 0)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(json.loads(saved[0])["quoted_tweet"], quote)
+
+    @mock.patch.object(MODULE, "run_fetch")
     def test_appends_only_unseen_urls_across_runs(self, run_fetch):
         run_fetch.return_value = [
             {"id": "1", "url": "https://x.com/creator/status/1", "text": "one"},

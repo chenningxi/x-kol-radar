@@ -1,0 +1,31 @@
+{
+  "profile": "https://x.com/example_author",
+  "id": "101",
+  "author": "example_author",
+  "name": "示例作者",
+  "created_at": "Mon Jan 01 01:00:00 +0000 2024",
+  "text": "This is an important development.",
+  "url": "https://x.com/example_author/status/101",
+  "translation_status": "translated",
+  "translation_zh": "这个进展很重要。",
+  "source_language": "en",
+  "translation_updated_at": "2024-01-01T01:05:00+00:00",
+  "quote_status": "available",
+  "quoted_tweet": {
+    "id": "100",
+    "author": "example_source",
+    "name": "示例团队",
+    "created_at": "Mon Jan 01 00:00:00 +0000 2024",
+    "text": "We are launching a new product today. Deliveries start next month.",
+    "url": "https://x.com/example_source/status/100",
+    "has_media": false,
+    "translation_status": "translated",
+    "translation_zh": "我们今天发布了新产品，下个月开始交付。",
+    "source_language": "en",
+    "translation_updated_at": "2024-01-01T01:05:00+00:00"
+  },
+  "content_classification": "substantive",
+  "content_reason": "引用包含新产品发布和交付时间",
+  "content_reviewed_at": "2024-01-01T01:05:00+00:00",
+  "content_policy_version": "v2"
+}

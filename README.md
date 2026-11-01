@@ -1,179 +1,233 @@
-# X KOL 增量监控与翻译发送
+# X KOL 增量监控与飞书推送
 
-一个面向本地 macOS 的 X/Twitter KOL 监控示例：通过 OpenCLI Browser Bridge 抓取公开推文，使用本地 JSONL 台账去重，再通过 `lark-cli` 将已处理内容发送到飞书群。非中文推文的翻译由使用者自行配置 Codex 定时任务，本项目不绑定任何特定 Codex 账号、任务或窗口。
+这是一个运行在 macOS 上的 X/Twitter KOL 增量监控工具。它通过 OpenCLI 和已登录的浏览器会话只读抓取公开推文，以 MySQL 保存推文、游标、审核、翻译和发送状态，使用 Redis 防止任务重入，再通过 `lark-cli` 推送到飞书群。
 
-## 特性
+当前版本：`v0.1.0`。采用 MIT 许可证。
 
-- 多账号监控，支持别名和单账号抓取上限；
-- URL/推文 ID 去重和增量游标；
-- 原文与中文翻译同时保留；
-- 翻译和飞书发送解耦，未完成翻译的内容不会发送；
-- 发送台账支持幂等，历史内容可以建立基线而不补发；
-- 不包含发帖、点赞、关注、转推、收藏或回复操作。
+项目对 X 严格只读，不会发帖、回复、点赞、关注、转推、收藏或执行其他写操作。
 
 ## 工作流
 
 ```text
-整点 launchd：抓取 X → tweet_ledger.jsonl
-每小时 05 分 Codex：翻译待处理记录并回写台账
-每小时 10 分 launchd：发送 translated / no_translation_needed 记录到飞书
+每小时 00 分：只读抓取 X，新推文写入 MySQL
+        ↓
+每小时 05 分：Codex 从 MySQL 导出待办，审核和翻译后回写 MySQL
+        ↓
+每小时 10 分：发送符合条件的内容，并把回执写入 MySQL
 ```
 
-## 外部依赖与职责
-
-本项目本身负责本地数据流转、增量去重、翻译状态判断和飞书发送；以下能力由使用者自行安装和配置：
-
-| 依赖 | 用途 | 配置方式 |
+| 阶段 | 入口 | 作用 |
 |---|---|---|
-| OpenCLI | 调用 X 推文读取命令 | 安装 `opencli` 并确保它在 `PATH` 中 |
-| Browser Bridge 扩展 | 让 OpenCLI 使用浏览器会话 | 在 Chrome/Chromium 中安装并启用扩展 |
-| X 登录会话 | 访问 X 的公开推文 | 在同一个 Chrome/Chromium profile 中登录 X |
-| Python 3.10+ | 运行本项目脚本 | `python3` 或 `X_KOL_PYTHON` |
-| lark-cli | 向飞书群发送消息 | 配置自己的 profile、机器人权限和群 ID |
-| Codex 定时任务 | 翻译非中文推文 | 使用者自行创建，目标是本地项目的 `data/tweet_ledger.jsonl` |
+| 抓取 | `scripts/run_x_kol_db.py sync` | 检查数据库游标、抓取并按推文 ID/URL 去重，不发送飞书 |
+| 审核与翻译 | Codex 定时任务 | 按仓库内策略处理数据库待办，不访问 X、不发送飞书 |
+| 发送 | `scripts/run_x_kol_db.py dispatch` | 只发送当前策略版本审核完成且满足发送条件的记录 |
 
-项目不会自动安装扩展、登录 X、创建飞书机器人，也不会自动创建 Codex 任务。
+MySQL 是唯一运行数据源。正式流程不读取或改写 `data/*.jsonl`。项目目录不保留旧台账、迁移备份或临时测试样本，代码版本通过 Git/GitHub 管理。
 
-## 安装前提
+## 运行条件
 
-- macOS；
-- 已登录 X 的 Chrome/Chromium；
-- OpenCLI 和 Browser Bridge 扩展；
-- Python 3.10+；
-- 已配置 `lark-cli`（仅在需要飞书发送时）。
+| 依赖 | 用途 |
+|---|---|
+| macOS | 使用 `launchd` 定时运行 |
+| Python 3.10+ | 运行项目脚本 |
+| MySQL 8+ | 保存全部运行状态和内容 |
+| Redis 6+ | 任务互斥锁 |
+| OpenCLI + Browser Bridge | 通过浏览器会话只读抓取 X |
+| Chrome/Chromium | 需已登录 X 并连接 Browser Bridge |
+| lark-cli | 以飞书机器人身份发送群消息 |
+| Codex 定时任务 | 审核内容并翻译非中文推文 |
 
-## 初始化
+## 快速开始
+
+### 1. 初始化运行环境
 
 ```bash
-cp data/x_profiles.example.md data/x_profiles.md
+git clone https://github.com/chenningxi/x-kol-radar.git x-kol-radar
+cd x-kol-radar
+./setup.sh
 cp .env.example .env
 ```
 
-编辑 `data/x_profiles.md` 添加监控账号。不要把真实 `.env`、台账、日志、截图或浏览器凭据提交到公开仓库。
+`setup.sh` 创建项目虚拟环境并安装 `requirements.txt`。编辑 `.env`，至少配置 MySQL、Redis、飞书、OpenCLI 和项目路径：
 
-添加账号：
+```dotenv
+X_KOL_FEISHU_PROFILE=your-lark-cli-profile
+X_KOL_FEISHU_CHAT_ID=oc_your_chat_id
+X_KOL_WORKSPACE=/absolute/path/to/x-kol-radar
+X_KOL_PYTHON=/absolute/path/to/x-kol-radar/.venv/bin/python
+X_KOL_OPENCLI=/absolute/path/to/opencli
+X_KOL_PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
 
-```bash
-python3 src/x_kol_sync/sync_x_kols.py add-profile \
-  --workspace "$PWD" \
-  'https://x.com/example' \
-  --alias '示例账号' \
-  --limit 30
+X_KOL_MYSQL_HOST=127.0.0.1
+X_KOL_MYSQL_PORT=3306
+X_KOL_MYSQL_DATABASE=your_database
+X_KOL_MYSQL_USER=your_user
+X_KOL_MYSQL_PASSWORD=your_password
+X_KOL_REDIS_HOST=127.0.0.1
+X_KOL_REDIS_PORT=6379
+X_KOL_REDIS_DB=0
+X_KOL_REDIS_PASSWORD=
+X_KOL_REDIS_PREFIX=xkol:radar
 ```
 
-## 手动运行
+先在 MySQL 中创建 `.env` 指定的数据库和专用用户（替换占位数据库名、用户名与密码）：
 
-先检查 Browser Bridge：
-
-```bash
-opencli doctor
+```sql
+CREATE DATABASE your_database CHARACTER SET utf8mb4;
+CREATE USER 'your_user'@'localhost' IDENTIFIED BY 'your_password';
+GRANT SELECT, INSERT, UPDATE, CREATE ON your_database.* TO 'your_user'@'localhost';
 ```
 
-只抓取：
-
-```bash
-X_KOL_WORKSPACE="$PWD" python3 scripts/run_x_kol_dispatch.py sync
-```
-
-只发送已完成翻译的内容：
+MySQL 和 Redis 需处于运行状态，MySQL 用户需能从配置的主机连接。`init` 不创建数据库，只初始化表结构：
 
 ```bash
 set -a; . ./.env; set +a
-X_KOL_WORKSPACE="$PWD" python3 scripts/run_x_kol_dispatch.py dispatch
+.venv/bin/python scripts/run_x_kol_db.py init
 ```
 
-## Codex 翻译任务（由使用者自行配置）
+`init` 只创建缺失的 `xkol_` 表，不清空已有表。
 
-建议用户创建一个独立的 Codex 定时任务，按自己的账号、模型和调度偏好运行。任务只处理 `data/tweet_ledger.jsonl`，将非中文推文的译文写回同一条记录，至少维护：
+### 2. 配置监控账号
 
-- `translation_status`: `translated`、`no_translation_needed` 或 `failed`；
-- `translation_zh`: 中文译文；
-- `translation_updated_at`；
-- `source_language`。
+编辑私有文件 `data/x_profiles.md`：
 
-Codex 不访问 X、不使用 Browser Bridge、不发送飞书，也不修改监控名单。
+```markdown
+| X 账号 | 别名 | 启用 | 单次抓取上限 | 包含转推 | 备注 |
+|---|---|---:|---:|---:|---|
+| <https://x.com/example> | 示例账号 | 是 | 30 | 否 |  |
+```
 
-可直接作为 Codex 任务提示词的模板：
-
-```text
-在项目 <WORKSPACE> 中，只处理 data/tweet_ledger.jsonl 里的待翻译推文。
-保留原文，按推文 URL/ID 关联，将非中文推文翻译成中文并写回同一条 JSONL 记录。
-中文推文标记为 no_translation_needed；成功翻译标记为 translated，并写入 translation_zh；失败标记为 failed 并记录 translation_error。
-不要访问 X，不要使用 Browser Bridge，不要发送飞书，不要修改监控名单，不要执行任何 X 互动操作。
-``` 
-
-## macOS launchd
-
-项目中的 `scripts/` 提供入口脚本，同步核心代码位于 `src/x_kol_sync/`，不依赖 Codex Skill 目录。公开仓库提供了 `launchd/` 下的通用 plist 模板，不包含个人路径、真实飞书群 ID 或本机解释器路径。使用者从 GitHub 下载项目后，先替换模板中的占位符：
-
-- `launchd/com.example.x-kol-sync.plist`：每小时整点抓取；
-- `launchd/com.example.x-kol-dispatch.plist`：每小时 10 分发送。
-
-云端项目安装示例：
+将账号配置写入 MySQL：
 
 ```bash
-git clone <公开仓库地址> ~/x-kol-monitor
-cd ~/x-kol-monitor
-./setup.sh
+set -a; . ./.env; set +a
+.venv/bin/python scripts/run_x_kol_db.py profiles
+```
 
-# 将 launchd/*.plist 中的 /ABSOLUTE/PATH/TO/x-kol-monitor
-# 替换为实际项目路径，并填写 Python、OpenCLI 和飞书配置。
+正式同步只读取 `xkol_profiles` 表。修改 Markdown 名单后需要再次运行 `profiles`；数据库中已有但从名单删除的账号不会被自动删除。
+
+### 3. 验证与首次同步
+
+```bash
+opencli doctor
+set -a; . ./.env; set +a
+.venv/bin/python scripts/run_x_kol_db.py status
+.venv/bin/python scripts/run_x_kol_db.py sync
+```
+
+首次同步抓到的内容会进入正常审核与推送流程，不创建历史基线跳过记录。只有账号本轮同步成功后才推进其数据库游标。
+
+## 从旧 JSONL 一次性迁移
+
+仅旧安装升级时执行一次：
+
+```bash
+set -a; . ./.env; set +a
+.venv/bin/python scripts/run_x_kol_db.py init
+.venv/bin/python scripts/run_x_kol_db.py import
+.venv/bin/python scripts/run_x_kol_db.py status
+```
+
+`import` 幂等导入旧监控名单、推文、同步历史、游标和发送/跳过回执；已有数据库译文不会被覆盖，游标只会前进不会倒退。确认推文、回执、同步历史和游标均完整迁入数据库后，删除旧 JSONL、旧游标文件、引用补全报告和备份目录。迁移完成后仅使用数据库命令。
+
+## 配置 05 分审核与翻译任务
+
+Codex 定时任务建议每小时 05 分运行，并使用以下提示词：
+
+```text
+在项目目录中完整读取并严格执行 prompts/translate_and_review_db.md 和 prompts/translate_and_review.md。MySQL 是唯一主数据源；不得读取或改写 data/*.jsonl。使用数据库 export、apply、check 完成审核翻译闭环，不访问 X、不发送飞书。
+```
+
+任务流程为：
+
+```bash
+set -a; . ./.env; set +a
+REVIEW_DIR=$(mktemp -d)
+TEMP_EXPORT="$REVIEW_DIR/export.jsonl"
+TEMP_UPDATES="$REVIEW_DIR/updates.jsonl"
+trap 'rm -f "$TEMP_EXPORT" "$TEMP_UPDATES"; rmdir "$REVIEW_DIR"' EXIT
+.venv/bin/python scripts/run_x_kol_db.py export > "$TEMP_EXPORT"
+# 按策略生成只含允许字段、id 和 revision 的临时更新文件
+.venv/bin/python scripts/run_x_kol_db.py apply --file "$TEMP_UPDATES"
+.venv/bin/python scripts/run_x_kol_db.py check
+```
+
+临时导出不是台账，必须放在系统临时目录并在运行后删除。`check` 不访问 X、不发送消息；只有 `awaiting_review=0` 且 `awaiting_translation=0` 才表示本轮待办达到发送或跳过条件。
+
+## 内容审核与引用推文
+
+审核采用高召回原则：`substantive` 和 `uncertain` 允许发送，`promotional` 和 `low_signal` 登记为跳过。产品名、品牌名或公司名本身不是过滤依据。当前策略版本维护在 `prompts/translate_and_review.md`。
+
+同步保留直接引用推文的作者、正文、时间和链接。审核结合作者正文与引用上下文；两段文字分别翻译并分别归属，飞书消息不会把引用作者的话算到外层作者名下。只有链接或表情的正文按无需翻译处理，引用详情不可用时不会编造内容。
+
+MySQL 的 `xkol_tweets.payload` 保存完整记录和未知字段；`quoted_tweet` 继续作为可选嵌套对象。数据库写回使用 `revision` 做乐观并发控制，冲突时整批回滚并要求重新导出。
+
+## 手动命令
+
+先加载 `.env`：
+
+```bash
+set -a; . ./.env; set +a
+```
+
+| 命令 | 作用 |
+|---|---|
+| `.venv/bin/python scripts/run_x_kol_db.py init` | 创建缺失的数据库表 |
+| `.venv/bin/python scripts/run_x_kol_db.py profiles` | 将监控名单更新到 MySQL |
+| `.venv/bin/python scripts/run_x_kol_db.py sync` | 执行一次只读 X 增量抓取 |
+| `.venv/bin/python scripts/run_x_kol_db.py export` | 导出未完成记录的临时工作副本 |
+| `.venv/bin/python scripts/run_x_kol_db.py apply --file FILE` | 原子回写允许的审核和翻译字段 |
+| `.venv/bin/python scripts/run_x_kol_db.py check` | 只读检查待审核、待翻译和待发送数量 |
+| `.venv/bin/python scripts/run_x_kol_db.py dispatch` | 发送已处理记录并写入数据库回执 |
+| `.venv/bin/python scripts/run_x_kol_db.py status` | 查看数据库队列状态 |
+
+`dispatch` 在联系飞书前先把完整消息批次和幂等键提交到 MySQL。失败批次会保留并使用相同幂等键重试；发送成功后才登记 `sent` 回执。
+
+## 启用 macOS 定时任务
+
+`launchd/` 提供两个模板：00 分运行 `scripts/run_x_kol_sync_launchd.sh`，10 分运行 `scripts/run_x_kol_dispatch_launchd.sh`。两个包装脚本都会加载项目 `.env`，并调用数据库入口。
+
+替换模板中的占位路径和飞书占位值，然后加载：
+
+```bash
+plutil -lint launchd/*.plist
 cp launchd/com.example.x-kol-sync.plist ~/Library/LaunchAgents/
 cp launchd/com.example.x-kol-dispatch.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.x-kol-sync.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.x-kol-dispatch.plist
 ```
 
-安装前先确认：
+不要同时运行旧 JSONL 调度和数据库调度。抓取需要 Mac 已登录用户会话，且 Browser Bridge 保持连接。
 
-```bash
-opencli doctor
-python3 src/x_kol_sync/sync_x_kols.py init --workspace "$PWD"
-```
+## 数据库表
 
-加载示例：
-
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.x-kol-sync.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.x-kol-dispatch.plist
-```
-
-整点抓取任务需要设置 `X_KOL_WORKSPACE`、`X_KOL_PYTHON`、`X_KOL_OPENCLI`；发送任务另外需要设置 `X_KOL_FEISHU_PROFILE`、`X_KOL_FEISHU_CHAT_ID`。两个任务都应使用 `StartCalendarInterval`，不要使用 `StartInterval`，这样才是固定整点/固定分钟运行。
-
-## 数据文件
-
-| 文件 | 用途 |
+| 表 | 用途 |
 |---|---|
-| `data/x_profiles.md` | 监控名单和别名 |
-| `data/tweet_ledger.jsonl` | 推文原文、翻译状态和译文 |
-| `data/x_cursors.json` | 每个账号的增量游标 |
-| `data/sync_history.jsonl` | 每次抓取结果 |
-| `data/feishu_send_ledger.jsonl` | 飞书发送/跳过台账 |
-| `logs/` | launchd 标准输出和错误日志 |
+| `xkol_profiles` | 账号配置和持久化游标 |
+| `xkol_tweets` | 推文、引用、媒体、审核、翻译和修订号 |
+| `xkol_receipts` | 发送/跳过回执和 URL 去重 |
+| `xkol_sync_history` | 每个账号的同步结果 |
+| `xkol_batches` | 发送前持久化的消息批次和幂等键 |
+
+Redis 只保存带命名空间的临时任务锁，不作为可恢复的数据源。运行日志仍写入私有的 `logs/`，但推文和工作流状态不写入本地 JSONL。
 
 ## 安全与隐私
 
-本项目不会保存 Cookie、请求头或令牌。公开发布前请确认：
+项目不保存 X Cookie、请求头或访问令牌。`.env`、实际监控名单和日志均被 `.gitignore` 排除。Git/GitHub 只管理代码与占位示例，不上传真实运行数据。公开仓库前仍应检查截图、日志及其他本地产物是否含真实账号、群聊、路径、Cookie 或令牌。
 
-- 删除真实推文台账和日志；
-- 删除聊天截图；
-- 替换飞书群 ID、CLI profile 和本机路径；
-- 不提交 `.env` 或任何密钥；
-- 检查推文正文是否包含不适合公开的内容。
+GitHub 上的代码版本不能恢复 MySQL 运行数据；数据库的持久化由使用者管理。请遵守 X、飞书及相关工具的使用条款和访问频率限制。
 
-## 开源发布前检查清单
+## 测试
 
-- 确认 `src/x_kol_sync/` 中的同步和抓取代码已作为仓库内代码提交；
-- 添加通用的 launchd plist 模板，并确认模板不含个人路径、群 ID 或账号名；
-- 添加一个初始化/依赖检查命令，自动创建 `data/`、检查 `opencli`、`lark-cli` 和配置项；
-- 在全新目录中完成一次从安装、登录、抓取、翻译到飞书发送的验证；
-- 明确 OpenCLI、Browser Bridge、X 登录、lark-cli 和 Codex 均由用户自行安装或配置；
-- 检查并删除真实台账、日志、截图、缓存、个人账号和聊天信息；
-- 选择并添加许可证；
-- 如果希望非 macOS 用户使用，再提供 Linux/Windows 的调度替代方案。
+```bash
+python3 -m unittest discover -s src/x_kol_sync/tests -v
+python3 -m py_compile src/x_kol_sync/*.py scripts/*.py
+git diff --check
+plutil -lint launchd/*.plist
+```
 
-当前项目已经完成脱敏配置化和说明文档初稿，但完成上述检查前，不应宣传为“一键开箱即用”。
+GitHub Actions 会在 Python 3.10、3.13 上检查代码，并使用独立的 MySQL/Redis 服务运行数据库集成测试。贡献方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证
 
-发布前请根据维护者意愿补充许可证，例如 MIT、Apache-2.0 或 GPL-3.0。
+MIT License，详见 `LICENSE`。

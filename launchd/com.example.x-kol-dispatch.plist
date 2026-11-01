@@ -24,7 +24,7 @@
 		<key>X_KOL_WORKSPACE</key>
 		<string>/ABSOLUTE/PATH/TO/x-kol-monitor</string>
 		<key>X_KOL_PYTHON</key>
-		<string>/usr/bin/python3</string>
+		<string>/ABSOLUTE/PATH/TO/x-kol-monitor/.venv/bin/python</string>
 		<key>X_KOL_FEISHU_PROFILE</key>
 		<string>your-lark-cli-profile</string>
 		<key>X_KOL_FEISHU_CHAT_ID</key>

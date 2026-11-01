@@ -5,6 +5,13 @@ __pycache__/
 .venv/
 .env
 data/*.tmp
+.env.*
+!.env.example
+*.sql.gz
+*.dump
+*.bak
+.pytest_cache/
+.ruff_cache/
 
 # Runtime state and private data
 data/*.jsonl

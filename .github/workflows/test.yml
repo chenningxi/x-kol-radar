@@ -1,0 +1,61 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s src/x_kol_sync/tests -v
+      - run: python -m py_compile src/x_kol_sync/*.py scripts/*.py
+      - run: zsh -n scripts/run_x_kol_sync_launchd.sh scripts/run_x_kol_dispatch_launchd.sh
+      - run: sh -n setup.sh
+      - run: plutil -lint launchd/*.plist
+      - run: git diff --check
+  database:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test-password
+          MYSQL_DATABASE: xkol_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ptest-password"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+    env:
+      X_KOL_RUN_DB_TESTS: '1'
+      X_KOL_MYSQL_HOST: 127.0.0.1
+      X_KOL_MYSQL_DATABASE: xkol_test
+      X_KOL_MYSQL_USER: root
+      X_KOL_MYSQL_PASSWORD: test-password
+      X_KOL_REDIS_HOST: 127.0.0.1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s src/x_kol_sync/tests -v
