@@ -36,7 +36,9 @@ set +a
 
 ## 三个阶段
 
-整点采集：
+正式自动调度每 15 分钟执行一次 `.venv/bin/python scripts/run_x_kol_db.py pipeline`，同一轮中依次完成下述三个阶段，不再分别按 00/05/10 分调度。以下命令也可用于单独运维。
+
+只读采集：
 
 ```bash
 .venv/bin/python scripts/run_x_kol_db.py sync
@@ -44,7 +46,17 @@ set +a
 
 每个账号先读取 1 条探针，游标无变化则跳过；首次或变化后按该账号上限读取。只更新该账号成功提交的游标；外部读取失败后停止当前轮次。OpenCLI 仍通过原有只读封装访问 X。零条返回只表示未取得数据，不代表账号没有发文。
 
-05 分 Codex 审核翻译：任务提示词使用 `prompts/translate_and_review_db.md`，审核标准使用 `prompts/translate_and_review.md`。
+DeepSeek 审核翻译：在 `.env` 配置 `DEEPSEEK_API_KEY` 和可选的 `X_KOL_DEEPSEEK_MODEL`（默认 `deepseek-flash`），加载环境后执行：
+
+```bash
+.venv/bin/python scripts/run_x_kol_db.py review --dry-run
+.venv/bin/python scripts/run_x_kol_db.py review
+.venv/bin/python scripts/run_x_kol_db.py check
+```
+
+`review` 直连 DeepSeek 官方 API，加载 `prompts/translate_and_review.md`，复用 `apply` 的字段白名单和修订号校验，按条提交，不落地导出文件。作者与引用正文分别翻译；无需翻译的文本、已有译文、失败重试和发送条件保持原策略。
+
+如需 Codex 手动审核翻译，提示词使用 `prompts/translate_and_review_db.md`，流程如下：
 
 ```bash
 REVIEW_DIR=$(mktemp -d)
@@ -63,7 +75,7 @@ trap 'rm -f "$REVIEW_DIR/export.jsonl" "$REVIEW_DIR/updates.jsonl"; rmdir "$REVI
 
 `apply` 只允许审核和翻译字段修改，保留原文、URL 和未知字段；修订号冲突时整批回滚，重新导出后再处理。仍需遵循当前提示词的引用独立翻译、审核版本等要求。`check` 不访问 X、不发消息，输出各状态数量。
 
-10 分程序发送：
+程序发送：
 
 ```bash
 .venv/bin/python scripts/run_x_kol_db.py dispatch
@@ -73,6 +85,8 @@ trap 'rm -f "$REVIEW_DIR/export.jsonl" "$REVIEW_DIR/updates.jsonl"; rmdir "$REVI
 
 ## 调度
 
-整点和 10 分包装脚本分别调用数据库 `sync`、`dispatch`，解释器使用项目虚拟环境并加载 `.env`。05 分 Codex 任务执行 `export → 审核翻译 → apply → check`。不要启动旧 JSONL 调度。
+正式包装脚本 `scripts/run_x_kol_pipeline_launchd.sh` 加载 `.env`，调用数据库 `pipeline`。对应的 `launchd/com.example.x-kol-pipeline.plist` 在每小时 00、15、30、45 分启动一轮。仅保留这一条自动调度；卸载旧三阶段调度，原有 Codex 定时审核保持暂停。
+
+整轮持有同一个运行锁，防止并发。同轮抓取、审核的成功记录分别提交；部分失败后仍尝试处理其他待办并发送已就绪内容。失败记录和待发送批次从 MySQL 恢复。默认每轮最多审核 20 条，最多约四分钟，可用 `pipeline --limit N` 调整条数；有剩余待办或阶段失败时退出码非零，不代表此前已提交的进度被撤回。
 
 Redis 只使用配置前缀下的锁，不清空其他 key。MySQL 会话锁同时防止 Redis 租约过期后的重入；Redis 不可用时任务明确失败。持久化游标始终在 MySQL，不依赖缓存恢复。`status/check/export` 使用只读查询（会短暂获取运行锁）。

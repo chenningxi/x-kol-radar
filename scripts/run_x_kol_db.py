@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit database workflow: init/import/sync/export/apply/check/dispatch/status."""
+"""Database workflow: pipeline/init/import/sync/review/export/apply/check/dispatch/status."""
 from __future__ import annotations
 
 import argparse
@@ -116,9 +116,13 @@ def collect(conn):
 
 
 def apply_reviews(conn, path):
+    return apply_review_updates(conn, read(path))
+
+
+def apply_review_updates(conn, updates):
+    """Apply file-based or API-generated updates through the same revision checks."""
     allowed = {'translation_status','source_language','translation_zh','translation_error','translation_updated_at',
                'content_classification','content_reason','content_policy_version','content_reviewed_at'}
-    updates = read(path)
     # Validate the complete batch before committing any changes.
     for item in updates:
         with conn.cursor() as c:
@@ -150,13 +154,23 @@ def queues(conn):
     return dispatch.partition_dispatch_rows([r for r,v in db.tweets(conn)], db.sent_urls(conn))
 
 
+def queue_status(conn):
+    ready, skipped, review, translation = queues(conn)
+    return dict(content_policy_version=dispatch.CONTENT_POLICY_VERSION,
+                tweets=len(db.tweets(conn)), terminal_urls=len(db.sent_urls(conn)),
+                send_ready=len(ready), skip_ready=len(skipped),
+                awaiting_review=len(review), awaiting_translation=len(translation))
+
+
 def send(conn):
     # Persist each batch before contacting Feishu; retries retain its idempotency key.
+    skipped_count = 0
     with conn.cursor() as c:
         c.execute("SELECT batch_key,payload FROM xkol_batches WHERE status='pending' ORDER BY updated_at LIMIT 1")
         batch = c.fetchone()
     if not batch:
         ready, skipped, review, translation = queues(conn)
+        skipped_count = len(skipped)
         for row in skipped:
             db.record(conn, 'xkol_receipts', dict(url=row['url'], status='skipped', reason=row.get('content_reason'), sent_at=sync.utc_now()))
         if not ready:
@@ -181,15 +195,72 @@ def send(conn):
     with conn.cursor() as c:
         c.execute("UPDATE xkol_batches SET status='sent' WHERE batch_key=%s", (batch['batch_key'],))
     conn.commit()
-    return {'sent':len(payload['rows'])}
+    result = {'sent':len(payload['rows'])}
+    if skipped_count:
+        result['skipped'] = skipped_count
+    return result
+
+
+def run_pipeline(conn, client, policy, *, limit=20):
+    """One locked round: collect, review, dispatch; committed progress survives failures."""
+    from x_kol_sync.deepseek_review import review_queue
+    result = {'errors': []}
+
+    def stage(name, operation):
+        try:
+            value = operation()
+        except Exception as exc:
+            # Earlier stages commit their progress; only discard the current transaction.
+            conn.rollback()
+            # Do not echo API response bodies, credentials or recipient configuration.
+            result['errors'].append(dict(stage=name, error_type=type(exc).__name__))
+            return None
+        result[name] = value
+        return value
+
+    synced = stage('sync', lambda: collect(conn))
+    reviewed = stage('review', lambda: review_queue(
+        conn, client, policy, dispatch, apply_review_updates, limit=limit))
+
+    def dispatch_ready():
+        # Retry persisted batches first, then send this round's newly reviewed rows.
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS n FROM xkol_batches WHERE status='pending'")
+            pending_batches = cursor.fetchone()['n']
+        outcomes = []
+        for _ in range(pending_batches + 1):
+            outcome = send(conn)
+            outcomes.append(outcome)
+            if not outcome.get('sent'):
+                break
+        return dict(sent=sum(item.get('sent', 0) for item in outcomes),
+                    skipped=sum(item.get('skipped', 0) for item in outcomes))
+
+    stage('dispatch', dispatch_ready)
+    result['queue'] = queue_status(conn)
+    sync_failed = synced is None or any(row.get('failed') for row in synced.get('profiles', []))
+    review_failed = reviewed is None or reviewed.get('failed') or reviewed.get('remaining')
+    result['ok'] = not bool(result['errors'] or sync_failed or review_failed
+                            or result['queue']['awaiting_review'] or result['queue']['awaiting_translation'])
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['init','import','profiles','sync','status','export','apply','check','dispatch'])
+    parser.add_argument('command', choices=['init','import','profiles','sync','status','export','apply','check','dispatch','review','pipeline'])
     parser.add_argument('--workspace', type=Path, default=ROOT)
     parser.add_argument('--file', type=Path)
+    parser.add_argument('--limit', type=int, default=20, help='maximum records per API review run')
+    parser.add_argument('--dry-run', action='store_true', help='review queue counts only; no API calls or writes')
     args = parser.parse_args()
+    if args.dry_run and args.command != 'review':
+        parser.error('--dry-run is only supported with review')
+    if args.limit < 1:
+        parser.error('--limit must be positive')
+    if args.command in {'review', 'pipeline'}:
+        from x_kol_sync.deepseek_review import Client, load_policy
+        policy = load_policy(ROOT, dispatch.CONTENT_POLICY_VERSION)
+        client = None if args.dry_run else Client()
     conn = db.connect()
     try:
         with db.task_lock(conn, 'workflow'):
@@ -204,11 +275,17 @@ def main():
                 result = {'profiles':'updated'}
             elif args.command == 'sync':
                 result = collect(conn)
+            elif args.command == 'pipeline':
+                result = run_pipeline(conn, client, policy, limit=args.limit)
             elif args.command == 'apply':
                 if not args.file: parser.error('--file required')
                 result = apply_reviews(conn, args.file)
             elif args.command == 'dispatch':
                 result = send(conn)
+            elif args.command == 'review':
+                from x_kol_sync.deepseek_review import review_queue
+                result = review_queue(conn, client, policy, dispatch, apply_review_updates,
+                                      limit=args.limit, dry_run=args.dry_run)
             elif args.command == 'export':
                 terminal = db.sent_urls(conn)
                 for row, revision in db.tweets(conn):
@@ -216,11 +293,14 @@ def main():
                         print(db.encode(dict(row, revision=revision)))
                 return 0
             else:
-                ready, skipped, review, translation = queues(conn)
-                result = dict(content_policy_version=dispatch.CONTENT_POLICY_VERSION, tweets=len(db.tweets(conn)), terminal_urls=len(db.sent_urls(conn)), send_ready=len(ready), skip_ready=len(skipped), awaiting_review=len(review), awaiting_translation=len(translation))
+                result = queue_status(conn)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             if args.command == 'check':
                 return int(bool(result['awaiting_review'] or result['awaiting_translation']))
+            if args.command == 'review':
+                return int(bool(result['failed'] or result['remaining']))
+            if args.command == 'pipeline':
+                return int(not result['ok'])
             return int(any(r.get('failed') for r in result.get('profiles', []))) if isinstance(result.get('profiles'),list) else 0
     except Exception:
         conn.rollback()

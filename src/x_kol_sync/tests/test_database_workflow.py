@@ -16,6 +16,14 @@ import run_x_kol_db as database_workflow
 
 
 class DatabaseContractTests(unittest.TestCase):
+    def test_dispatch_cannot_silently_ignore_review_dry_run(self):
+        with mock.patch.object(sys, 'argv', ['run_x_kol_db.py', 'dispatch', '--dry-run']), \
+             mock.patch.object(database, 'connect') as connect:
+            with self.assertRaises(SystemExit) as exit:
+                database_workflow.main()
+            self.assertEqual(exit.exception.code, 2)
+        connect.assert_not_called()
+
     def test_database_name_must_be_explicit(self):
         with mock.patch.dict('os.environ', {}, clear=True):
             with self.assertRaisesRegex(ValueError, 'X_KOL_MYSQL_DATABASE'):

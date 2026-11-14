@@ -1,6 +1,6 @@
 # X KOL 内容审核与翻译策略 v2
 
-本文件是每小时 05 分 Codex 任务的唯一审核策略来源。MySQL 是主数据源，任务必须完整执行本文件，不能只按品牌、产品名或账号身份过滤。
+本文件是审核翻译任务（每 15 分钟串联流程中的 DeepSeek API，或手动 Codex）的唯一审核策略来源。MySQL 是主数据源，任务必须完整执行本文件，不能只按品牌、产品名或账号身份过滤。
 
 ## 处理范围
 
@@ -11,7 +11,7 @@
    - `content_policy_version` 不是 `v2`；
    - 当前分类为 `substantive` 或 `uncertain`，但作者正文或 `quoted_tweet.text` 的翻译尚未完成（完成状态为 `translated`、`no_translation_needed` 或兼容值 `not_needed`）。
 4. 已有有效译文时不要重复翻译，只补做或更新内容审核。
-5. 当前版本已经归为 `promotional` 或 `low_signal` 的记录不需要翻译；10 分发送阶段会将它们登记为跳过。
+5. 当前版本已经归为 `promotional` 或 `low_signal` 的记录不需要翻译；发送阶段会将它们登记为跳过。
 6. 不得沿用旧运行摘要中的版本或“已知失败无需处理”结论；每次以本文件及发送脚本当前版本为准。
 
 ## 审核字段
@@ -90,7 +90,7 @@
 - 运行前核对本文件版本与 `scripts/run_x_kol_dispatch.py` 中的 `CONTENT_POLICY_VERSION` 一致；版本不一致时停止写入并报告需要修复。
 - 通过 `scripts/run_x_kol_db.py apply` 安全回写后，运行 `.venv/bin/python scripts/run_x_kol_db.py check`。该模式只读，不访问 X、不发送飞书、不修改数据库。
 - 检查 JSON 输出的 `content_policy_version` 与本次审核版本一致。只有 `awaiting_review=0` 且 `awaiting_translation=0` 才表示本轮未发送记录均已达到发送或跳过条件；仍有待处理记录时继续处理可恢复情况，真实失败则明确报告，不得声称处理闭环。
-- `send_ready`、`skip_ready` 是待发送/待登记数量，不是发送成功数量。实际完成发送只能由 10 分发送阶段写入 MySQL 的 `sent`/`skipped` 回执确认。
+- `send_ready`、`skip_ready` 是待发送/待登记数量，不是发送成功数量。实际完成发送只能由发送阶段写入 MySQL 的 `sent`/`skipped` 回执确认。
 
 ## 写入与安全要求
 
