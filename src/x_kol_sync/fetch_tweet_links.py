@@ -53,6 +53,8 @@ OUTPUT_FIELDS = (
     "url",
     "name",
     "has_media",
+    "media_urls",
+    "media_posters",
     "quote_status",
     "quoted_tweet",
 )
@@ -118,6 +120,8 @@ def build_opencli_command(
         str(page_delay),
         "-f",
         "json",
+        "--window",
+        "background",
     ]
 
 
@@ -202,6 +206,9 @@ def prepare_records(
             record["name"] = item["name"]
         if "has_media" in item:
             record["has_media"] = bool(item["has_media"])
+        for key in ("media_urls", "media_posters"):
+            if isinstance(item.get(key), list):
+                record[key] = item[key]
         raw_quote = item.get("quoted_tweet")
         if isinstance(raw_quote, dict):
             # Never use the outer author as a fallback for the quoted author.
@@ -217,6 +224,9 @@ def prepare_records(
                     "url": quote_url,
                     "has_media": bool(raw_quote.get("has_media")),
                 }
+                for key in ("media_urls", "media_posters"):
+                    if isinstance(raw_quote.get(key), list):
+                        record["quoted_tweet"][key] = raw_quote[key]
                 record["quote_status"] = "available"
             else:
                 record["quote_status"] = "unavailable"
@@ -240,8 +250,9 @@ def render_records(records: list[dict[str, Any]], output_format: str) -> str:
         writer.writeheader()
         for record in records:
             csv_record = dict(record)
-            if isinstance(csv_record.get("quoted_tweet"), dict):
-                csv_record["quoted_tweet"] = json.dumps(csv_record["quoted_tweet"], ensure_ascii=False)
+            for key in ("quoted_tweet", "media_urls", "media_posters"):
+                if isinstance(csv_record.get(key), (dict, list)):
+                    csv_record[key] = json.dumps(csv_record[key], ensure_ascii=False)
             writer.writerow(csv_record)
         return buffer.getvalue()
     raise ValueError(f"Unsupported output format: {output_format}")

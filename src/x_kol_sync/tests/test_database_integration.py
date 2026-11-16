@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 sys.path.insert(0, str(ROOT / 'scripts'))
 from x_kol_sync import database as db
 from x_kol_sync import deepseek_review
+from x_kol_sync.assets import AssetStore
 import run_x_kol_db as workflow
 
 
@@ -35,6 +36,180 @@ class DatabaseIntegrationTests(unittest.TestCase):
                     translation_status='translated', translation_zh='重要更新',
                     content_policy_version=workflow.dispatch.CONTENT_POLICY_VERSION,
                     content_classification='substantive', unknown={'preserved': True})
+
+    def test_new_tweet_image_failure_keeps_text_ready_and_advances_cursor(self):
+        profile = dict(handle='example', profile_url='https://x.com/example', enabled=True, limit=20)
+        with self.conn.cursor() as cursor:
+            cursor.execute('INSERT INTO xkol_profiles(handle,config) VALUES(%s,%s)',
+                           ('example', db.encode(profile)))
+        self.conn.commit()
+        row = dict(self.row('123'), has_media=True,
+                   media_urls=['https://pbs.twimg.com/media/example.jpg'],
+                   quoted_tweet=dict(id='100', author='source', text='', has_media=True,
+                                     media_urls=['https://pbs.twimg.com/media/quote.jpg']))
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, X_KOL_MEDIA_DIR=folder):
+            store = AssetStore()
+            with mock.patch.object(workflow, 'AssetStore', return_value=store), \
+                 mock.patch.object(store.opener, 'open', side_effect=TimeoutError()), \
+                 mock.patch.object(workflow, 'repair_author_avatars', return_value={'authors_attempted': 0}), \
+                 mock.patch.object(workflow, 'repair_author_verifications', return_value={'authors_attempted': 0}), \
+                 mock.patch.object(workflow.sync, 'run_doctor', return_value=({}, 0)), \
+                 mock.patch.object(workflow.sync, 'run_fetch', return_value=[row]):
+                result = workflow.collect(self.conn)
+        self.assertEqual(result['profiles'][0]['status'], 'ok')
+        self.assertEqual(result['images_failed'], 2)
+        saved, revision = db.tweets(self.conn)[0]
+        self.assertEqual((saved['text'], saved['translation_zh']), (row['text'], row['translation_zh']))
+        self.assertEqual(saved['media_status'], 'partial')
+        self.assertEqual(saved['quoted_tweet']['media_status'], 'partial')
+        self.assertEqual(saved['unknown'], row['unknown'])
+        self.assertEqual(revision, 1)
+        self.assertEqual(len(workflow.queues(self.conn)[0]), 1)
+        with self.conn.cursor() as cursor:
+            cursor.execute('SELECT cursor_id FROM xkol_profiles WHERE handle=%s', ('example',))
+            self.assertEqual(cursor.fetchone()['cursor_id'], '123')
+
+    def test_repair_assets_preserves_review_receipts_and_revision_contract(self):
+        row = dict(self.row(), media_urls=['https://pbs.twimg.com/media/example.jpg'],
+                   media_status='partial', media=[dict(url='https://pbs.twimg.com/media/example.jpg',
+                                                      image={'status': 'failed'})])
+        db.insert_tweet(self.conn, row)
+        db.record(self.conn, 'xkol_receipts', dict(url=row['url'], status='sent'))
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, X_KOL_MEDIA_DIR=folder):
+            store = AssetStore()
+            with mock.patch.object(workflow, 'AssetStore', return_value=store), \
+                 mock.patch.object(workflow, 'repair_author_avatars', return_value={'profiles_attempted': 0, 'profiles_failed': 0}), \
+                 mock.patch.object(workflow, 'repair_author_verifications', return_value={'authors_failed': 0}), \
+                 mock.patch.object(store, 'save', return_value={'status': 'saved', 'local_path': 'images/example.jpg'}):
+                result = workflow.repair_assets(self.conn, Path(folder), limit=1)
+        self.assertEqual(result['tweets_updated'], 1)
+        self.assertEqual(result['images_failed'], 0)
+        saved, revision = db.tweets(self.conn)[0]
+        self.assertEqual(revision, 2)
+        self.assertEqual(saved['media_status'], 'complete')
+        self.assertEqual(saved['translation_zh'], row['translation_zh'])
+        self.assertEqual(saved['unknown'], row['unknown'])
+        self.assertEqual(saved['content_policy_version'], row['content_policy_version'])
+        self.assertEqual(db.sent_urls(self.conn), {row['url']})
+
+    def test_quiet_profile_sync_automatically_repairs_quoted_media_without_resending(self):
+        profile = dict(handle='example', profile_url='https://x.com/example', enabled=True, limit=30)
+        with self.conn.cursor() as cursor:
+            cursor.execute('INSERT INTO xkol_profiles(handle,config,cursor_id) VALUES(%s,%s,%s)',
+                           ('example', db.encode(profile), '123'))
+        row = dict(self.row('123'), quoted_tweet=dict(id='100', author='source', text='quote',
+            media_status='partial', media_urls=['https://pbs.twimg.com/media/quote.jpg']))
+        db.insert_tweet(self.conn, row)
+        db.record(self.conn, 'xkol_receipts', dict(url=row['url'], status='sent'))
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, X_KOL_MEDIA_DIR=folder):
+            store = AssetStore()
+            with mock.patch.object(workflow, 'AssetStore', return_value=store), \
+                 mock.patch.object(workflow, 'repair_author_avatars', return_value={'authors_attempted': 0}), \
+                 mock.patch.object(workflow, 'repair_author_verifications', return_value={'authors_attempted': 0}), \
+                 mock.patch.object(store, 'save', return_value={'status': 'saved', 'local_path': 'images/quote.jpg'}), \
+                 mock.patch.object(workflow.sync, 'run_doctor', return_value=({}, 0)), \
+                 mock.patch.object(workflow.sync, 'run_fetch', return_value=[{'id': '123'}]):
+                result = workflow.collect(self.conn)
+        self.assertEqual(result['asset_retry']['tweets_updated'], 1)
+        self.assertEqual(result['profiles'][0]['mode'], 'probe_unchanged')
+        saved, revision = db.tweets(self.conn)[0]
+        self.assertEqual(revision, 2)
+        self.assertEqual(saved['quoted_tweet']['media_status'], 'complete')
+        self.assertEqual(saved['quoted_tweet']['author'], 'source')
+        self.assertEqual(saved['translation_zh'], row['translation_zh'])
+        self.assertEqual(db.sent_urls(self.conn), {row['url']})
+        with self.conn.cursor() as cursor:
+            cursor.execute('SELECT cursor_id FROM xkol_profiles WHERE handle=%s', ('example',))
+            self.assertEqual(cursor.fetchone()['cursor_id'], '123')
+
+    def test_profile_download_metadata_survives_reload_without_cursor_reset(self):
+        old = dict(handle='example', alias='old', unknown={'preserved': True})
+        with self.conn.cursor() as cursor:
+            cursor.execute('INSERT INTO xkol_profiles(handle,config,cursor_id) VALUES(%s,%s,%s)',
+                           ('example', db.encode(old), '123'))
+        self.conn.commit()
+        avatar = dict(status='saved', source_url='https://pbs.twimg.com/profile_images/123/example.jpg',
+                      local_path='avatars/example.jpg')
+        with mock.patch.object(workflow.sync, 'load_profiles', return_value=[dict(handle='example', alias='new')]), \
+             mock.patch.object(workflow.AssetStore, 'avatar', return_value=avatar):
+            workflow.load_profiles(self.conn, ROOT)
+        self.conn.commit()
+        with self.conn.cursor() as cursor:
+            cursor.execute('SELECT config,cursor_id FROM xkol_profiles WHERE handle=%s', ('example',))
+            stored = cursor.fetchone()
+        config = json.loads(stored['config'])
+        self.assertEqual((config['alias'], config['avatar']), ('new', avatar))
+        self.assertEqual(config['unknown'], old['unknown'])
+        self.assertEqual(stored['cursor_id'], '123')
+
+    def test_author_avatar_backfill_preserves_workflow_and_keeps_quotes_unmonitored(self):
+        from x_kol_sync import avatars
+        profile = dict(handle='example', enabled=True, unknown='keep')
+        with self.conn.cursor() as cursor:
+            cursor.execute('INSERT INTO xkol_profiles(handle,config,cursor_id) VALUES(%s,%s,%s)',
+                           ('example', db.encode(profile), '999'))
+        row = dict(self.row('123'), quoted_tweet=dict(id='100', author='source', text='quoted text', unknown='keep'))
+        db.insert_tweet(self.conn, row)
+        db.record(self.conn, 'xkol_receipts', dict(url=row['url'], status='sent'))
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, X_KOL_MEDIA_DIR=folder):
+            root = Path(folder); (root / 'avatars').mkdir()
+            for handle in ('example', 'source'):
+                (root / 'avatars' / (handle + '.png')).write_bytes(b'avatar-file')
+            store = AssetStore(root)
+            def saved(value):
+                return dict(status='saved', handle=value['handle'], local_path='avatars/' + value['handle'] + '.png')
+            with mock.patch.object(avatars, 'AssetStore', return_value=store), \
+                 mock.patch.object(store, 'avatar', side_effect=saved) as read:
+                result = workflow.repair_author_avatars(self.conn, root)
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(result['authors_remaining'], 0)
+        saved_row, revision = db.tweets(self.conn)[0]
+        self.assertEqual(revision, 3)
+        self.assertEqual(saved_row['author_avatar']['handle'], 'example')
+        self.assertEqual(saved_row['quoted_tweet']['author_avatar']['handle'], 'source')
+        self.assertEqual(saved_row['quoted_tweet']['text'], 'quoted text')
+        self.assertEqual(saved_row['translation_zh'], row['translation_zh'])
+        self.assertEqual(saved_row['unknown'], row['unknown'])
+        self.assertEqual(db.sent_urls(self.conn), {row['url']})
+        with self.conn.cursor() as cursor:
+            cursor.execute('SELECT handle,config,cursor_id FROM xkol_profiles')
+            profiles = cursor.fetchall()
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]['handle'], 'example')
+        self.assertEqual(profiles[0]['cursor_id'], '999')
+        self.assertEqual(json.loads(profiles[0]['config'])['unknown'], 'keep')
+
+    def test_verification_backfill_keeps_workflow_and_quote_ownership(self):
+        from x_kol_sync import verification as v
+        with self.conn.cursor() as cursor:
+            cursor.execute('INSERT INTO xkol_profiles(handle,config,cursor_id) VALUES(%s,%s,%s)',
+                           ('example', db.encode(dict(handle='example', unknown='keep')), '999'))
+        row = dict(self.row('123'), quoted_tweet=dict(id='100', author='source', text='quote', unknown='keep'))
+        db.insert_tweet(self.conn, row)
+        db.record(self.conn, 'xkol_receipts', dict(url=row['url'], status='sent'))
+        self.conn.commit()
+        def read(handle, timeout):
+            return dict(handle=handle, verified=handle == 'source', checked_at=v.now(), source_url='https://x.com/' + handle)
+        with mock.patch.object(v, 'read_verification', side_effect=read) as source:
+            result = v.repair_author_verifications(self.conn, ROOT)
+        self.assertEqual(source.call_count, 2)
+        self.assertEqual(result['authors_remaining'], 0)
+        saved, revision = db.tweets(self.conn)[0]
+        self.assertEqual(revision, 3)
+        self.assertFalse(saved['author_verification']['verified'])
+        self.assertEqual(saved['quoted_tweet']['author_verification']['handle'], 'source')
+        self.assertTrue(saved['quoted_tweet']['author_verification']['verified'])
+        for key in ('text', 'translation_zh', 'content_policy_version', 'unknown'):
+            self.assertEqual(saved[key], row[key])
+        self.assertEqual(db.sent_urls(self.conn), {row['url']})
+        with self.conn.cursor() as cursor:
+            cursor.execute('SELECT handle,config,cursor_id FROM xkol_profiles'); profiles = cursor.fetchall()
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]['cursor_id'], '999')
+        self.assertEqual(json.loads(profiles[0]['config'])['unknown'], 'keep')
 
     def apply(self, updates):
         with tempfile.TemporaryDirectory() as folder:
@@ -151,7 +326,7 @@ class DatabaseIntegrationTests(unittest.TestCase):
         self.assertEqual(saved['2'][1], 1)
 
     def test_pipeline_delivers_successful_rows_while_failed_rows_wait_and_do_not_duplicate(self):
-        def collect(conn):
+        def collect(conn, workspace=ROOT):
             for tweet_id in ('1', '2'):
                 value = self.row(tweet_id)
                 value.pop('content_policy_version')

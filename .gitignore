@@ -17,6 +17,7 @@ data/*.tmp
 data/*.jsonl
 data/x_cursors.json
 data/x_profiles.md
+data/media/
 data/.x-kol-sync.lock
 logs/
 

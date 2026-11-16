@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Database workflow: pipeline/init/import/sync/review/export/apply/check/dispatch/status."""
+"""Database workflow: pipeline/init/import/profiles/assets/sync/review/export/apply/check/dispatch/status."""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +13,9 @@ sys.path.insert(0, str(ROOT / 'src'))
 sys.path.insert(0, str(ROOT / 'scripts'))
 from x_kol_sync import database as db
 from x_kol_sync import sync_x_kols as sync
+from x_kol_sync.assets import AssetStore, media_budget
+from x_kol_sync.avatars import repair_author_avatars
+from x_kol_sync.verification import repair_author_verifications
 import run_x_kol_dispatch as dispatch
 
 
@@ -28,12 +31,61 @@ def initialize(conn):
     conn.commit()
 
 
-def load_profiles(conn, workspace):
+def load_profiles(conn, workspace, *, download_avatars=True):
     profiles = sync.load_profiles(workspace / 'data/x_profiles.md')
     with conn.cursor() as c:
-        for p in profiles:
+        c.execute('SELECT handle,config FROM xkol_profiles')
+        existing = {row['handle']: json.loads(row['config']) for row in c.fetchall()}
+    store = AssetStore(workspace, budget=media_budget('avatar'))
+    failed = 0
+    # Give new profiles the image budget before older missing-avatar profiles.
+    for p in sorted(profiles, key=lambda p: p['handle'].lower() in existing):
+        config = dict(existing.get(p['handle'].lower(), {}), **p)
+        if download_avatars:
+            config['avatar'] = store.avatar(config)
+            failed += int(config['avatar']['status'] != 'saved')
+        with conn.cursor() as c:
             c.execute('INSERT INTO xkol_profiles(handle,config) VALUES(%s,%s) ON DUPLICATE KEY UPDATE config=%s',
-                      (p['handle'].lower(), db.encode(p), db.encode(p)))
+                      (p['handle'].lower(), db.encode(config), db.encode(config)))
+    return dict(profiles='updated', avatars_failed=failed)
+
+
+def repair_assets(conn, workspace, *, limit=20):
+    """Retry real authors' avatars and known tweet images, without fetching history."""
+    result = repair_author_avatars(conn, workspace, limit=limit)
+    result.update(repair_tweet_assets(conn, workspace, limit=limit))
+    result['verification_retry'] = repair_author_verifications(conn, workspace, limit=limit)
+    return result
+
+
+def repair_tweet_assets(conn, workspace, *, limit=20):
+    """Retry persisted partial media even when no new timeline rows are available."""
+    store = AssetStore(workspace, budget=media_budget('retry'))
+    result = dict(tweets_updated=0, images_failed=0, budget_exhausted=False)
+    with conn.cursor() as c:
+        c.execute("SELECT tweet_id,payload,revision FROM xkol_tweets WHERE "
+                  "JSON_UNQUOTE(JSON_EXTRACT(payload,'$.media_status'))='partial' OR "
+                  "JSON_UNQUOTE(JSON_EXTRACT(payload,'$.quoted_tweet.media_status'))='partial' "
+                  'ORDER BY updated_at,tweet_id LIMIT %s', (limit,))
+        tweets = c.fetchall()
+    for item in tweets:
+        # Leave rows not attempted this round untouched and first in the next
+        # retry queue, rather than marking the whole page failed after timeout.
+        if store.budget <= 0:
+            result['budget_exhausted'] = True
+            break
+        row = store.enrich_tweet(json.loads(item['payload']))
+        for part in (row, row.get('quoted_tweet') or {}):
+            result['images_failed'] += sum(image['image']['status'] != 'saved' for image in part.get('media', []))
+        with conn.cursor() as c:
+            c.execute('UPDATE xkol_tweets SET payload=%s,revision=revision+1 WHERE tweet_id=%s AND revision=%s',
+                      (db.encode(row), item['tweet_id'], item['revision']))
+            if c.rowcount != 1:
+                raise ValueError('Revision conflict while saving image metadata')
+        conn.commit()
+        result['tweets_updated'] += 1
+    result['budget_exhausted'] = result['budget_exhausted'] or store.budget <= 0
+    return result
 
 
 def newest_cursor(existing, imported):
@@ -49,7 +101,7 @@ def newest_cursor(existing, imported):
 
 def import_files(conn, workspace):
     """One-time compatibility migration; scheduled runtime never reads JSONL."""
-    load_profiles(conn, workspace)
+    load_profiles(conn, workspace, download_avatars=False)
     rows = read(workspace / 'data/tweet_ledger.jsonl')
     added = sum(db.insert_tweet(conn, r) for r in rows)
     for r in read(workspace / 'data/feishu_send_ledger.jsonl'):
@@ -70,7 +122,11 @@ def import_files(conn, workspace):
     return {'source_rows': len(rows), 'inserted': added, 'existing': len(rows)-added}
 
 
-def collect(conn):
+def collect(conn, workspace=ROOT):
+    # Existing URLs are intentionally skipped by insert_tweet. Their images need
+    # a separate retry before probing cursors, including quiet accounts and
+    # rounds where the browser is unavailable. This uses the caller's same lock.
+    asset_retry = repair_tweet_assets(conn, workspace)
     health, code = sync.run_doctor()
     if code:
         raise RuntimeError(db.encode(health))
@@ -78,6 +134,7 @@ def collect(conn):
         c.execute('SELECT handle,config,cursor_id FROM xkol_profiles')
         profiles = c.fetchall()
     results = []
+    store = AssetStore(workspace, budget=media_budget('download'))
     for item in profiles:
         p = json.loads(item['config'])
         if not p['enabled']:
@@ -95,7 +152,7 @@ def collect(conn):
                 result['fetched'] = len(rows)
                 for row in rows:
                     row.setdefault('first_seen_at', sync.utc_now())
-                    result['added'] += int(db.insert_tweet(conn, row))
+                    result['added'] += int(db.insert_tweet(conn, row, prepare=store.enrich_tweet))
                 result['skipped'] = len(rows)-result['added']
                 maximum = max([cursor] + [int(r['id']) for r in rows])
                 with conn.cursor() as c:
@@ -112,7 +169,12 @@ def collect(conn):
             # Stop on external failures; no repeated X requests.
             break
         results.append(result)
-    return {'profiles': results}
+    avatar_retry = (dict(skipped='sync_failed') if any(item.get('failed') for item in results)
+                    else repair_author_avatars(conn, workspace))
+    verification_retry = (dict(skipped='sync_failed') if any(item.get('failed') for item in results)
+                          else repair_author_verifications(conn, workspace))
+    return {'profiles': results, 'images_saved': store.saved, 'images_failed': store.failed,
+            'asset_retry': asset_retry, 'avatar_retry': avatar_retry, 'verification_retry': verification_retry}
 
 
 def apply_reviews(conn, path):
@@ -201,7 +263,7 @@ def send(conn):
     return result
 
 
-def run_pipeline(conn, client, policy, *, limit=20):
+def run_pipeline(conn, client, policy, *, limit=20, workspace=ROOT):
     """One locked round: collect, review, dispatch; committed progress survives failures."""
     from x_kol_sync.deepseek_review import review_queue
     result = {'errors': []}
@@ -218,7 +280,7 @@ def run_pipeline(conn, client, policy, *, limit=20):
         result[name] = value
         return value
 
-    synced = stage('sync', lambda: collect(conn))
+    synced = stage('sync', lambda: collect(conn, workspace))
     reviewed = stage('review', lambda: review_queue(
         conn, client, policy, dispatch, apply_review_updates, limit=limit))
 
@@ -247,10 +309,10 @@ def run_pipeline(conn, client, policy, *, limit=20):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['init','import','profiles','sync','status','export','apply','check','dispatch','review','pipeline'])
+    parser.add_argument('command', choices=['init','import','profiles','assets','sync','status','export','apply','check','dispatch','review','pipeline'])
     parser.add_argument('--workspace', type=Path, default=ROOT)
     parser.add_argument('--file', type=Path)
-    parser.add_argument('--limit', type=int, default=20, help='maximum records per API review run')
+    parser.add_argument('--limit', type=int, default=20, help='maximum review records, or authors and tweets per assets run')
     parser.add_argument('--dry-run', action='store_true', help='review queue counts only; no API calls or writes')
     args = parser.parse_args()
     if args.dry_run and args.command != 'review':
@@ -270,13 +332,14 @@ def main():
             elif args.command == 'import':
                 result = import_files(conn, args.workspace)
             elif args.command == 'profiles':
-                load_profiles(conn, args.workspace)
+                result = load_profiles(conn, args.workspace)
                 conn.commit()
-                result = {'profiles':'updated'}
+            elif args.command == 'assets':
+                result = repair_assets(conn, args.workspace, limit=args.limit)
             elif args.command == 'sync':
-                result = collect(conn)
+                result = collect(conn, args.workspace)
             elif args.command == 'pipeline':
-                result = run_pipeline(conn, client, policy, limit=args.limit)
+                result = run_pipeline(conn, client, policy, limit=args.limit, workspace=args.workspace)
             elif args.command == 'apply':
                 if not args.file: parser.error('--file required')
                 result = apply_reviews(conn, args.file)
@@ -301,6 +364,9 @@ def main():
                 return int(bool(result['failed'] or result['remaining']))
             if args.command == 'pipeline':
                 return int(not result['ok'])
+            if args.command == 'assets':
+                return int(bool(result['profiles_failed'] or result['images_failed'] or result.get('authors_failed')
+                                or result['verification_retry']['authors_failed']))
             return int(any(r.get('failed') for r in result.get('profiles', []))) if isinstance(result.get('profiles'),list) else 0
     except Exception:
         conn.rollback()

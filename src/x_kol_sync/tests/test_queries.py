@@ -15,6 +15,20 @@ import query_x_kol_tweets
 
 
 class QueryTests(unittest.TestCase):
+    def test_json_queries_expose_image_metadata_without_downloads(self):
+        connection = mock.MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        avatar = {'status': 'saved', 'local_path': 'avatars/example.jpg'}
+        cursor.fetchall.return_value = [dict(handle='example', config=json.dumps(
+            dict(avatar=avatar)), tweet_count=1)]
+        self.assertEqual(queries.profiles(connection)[0]['avatar'], avatar)
+        payload = {'media': [{'image': {'status': 'saved', 'local_path': 'images/example.jpg'}}]}
+        cursor.fetchone.return_value = {'total': 1}
+        cursor.fetchall.return_value = [dict(tweet_id='1', url='https://x.com/example/status/1', payload=json.dumps(payload))]
+        result = queries.tweet_page(connection, 'example')
+        self.assertEqual(result['items'][0]['payload'], payload)
+        connection.commit.assert_not_called()
+
     def test_read_connection_enforces_read_only_and_closes_on_failure(self):
         connection = mock.MagicMock()
         with mock.patch.object(queries.db, 'connect', return_value=connection):

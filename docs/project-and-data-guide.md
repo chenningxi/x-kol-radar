@@ -121,8 +121,10 @@ MySQL 是唯一运行数据源。Redis 只保存临时任务锁，不能用于�
 | `text` | 原文正文，审核翻译不覆盖它 |
 | `likes`、`retweets`、`replies`、`views` | 采集时返回的互动数；上游未返回时当前封装可能填 `0` |
 | `has_media` | 可选媒体存在标记，不等于已下载媒体或完成图片、视频理解 |
+| `media_urls`、`media_posters` | 上游返回的媒体原始地址、按顺序对应的静态封面地址 |
+| `media`、`media_status` | 新记录的图片/视频封面下载元数据与 `complete` / `partial` / `unavailable` 状态；视频文件不下载 |
 | `quote_status` | 检测到引用时的可用状态；缺失不能直接推断有无引用 |
-| `quoted_tweet` | 可选直接引用对象，含独立的 `id`、`author`、`name`、`text`、`created_at`、`url`、`has_media` 及翻译字段 |
+| `quoted_tweet` | 可选直接引用对象，含独立的身份、正文、时间、链接、媒体地址与下载元数据及翻译字段 |
 | `content_classification`、`content_reason` | 内容分类与简短中文理由；不是主题标签或情绪标签 |
 | `content_policy_version`、`content_reviewed_at` | 审核策略版本和审核时间 |
 | `translation_status`、`translation_zh`、`source_language` | 翻译状态、简体中文译文和语言标记 |
@@ -131,6 +133,10 @@ MySQL 是唯一运行数据源。Redis 只保存临时任务锁，不能用于�
 | 表列 `revision` | 并发控制修订号；审核导出时附加在记录顶层，不是推文内容版本 |
 
 数据库连接将会话时区设置为 UTC；审核和翻译时间使用 UTC ISO 8601。`created_at` 保留上游格式，分析前应单独解析。飞书消息对可识别的发布时间转换为北京时间，无法解析时保留原值。
+
+监控账号头像保存在 `xkol_profiles.config.avatar`，外层及引用作者分别保存在 `payload.author_avatar` 和 `payload.quoted_tweet.author_avatar`；使用时核对其中的 `handle` 与真实作者相符。成功同步后会补齐最多 20 位作者的头像，独立使用 `X_KOL_AVATAR_BUDGET_SECONDS`（默认 180 秒），结果输出为 `avatar_retry`。同一作者复用已保存文件，未监控的引用作者不会被加入监控名单。媒体元数据中的 `image.status=saved` 才表示图片或封面已下载，`local_path` 相对于私有媒体目录（默认 `data/media/`，可设置 `X_KOL_MEDIA_DIR`），文件不写进 MySQL。`sync/pipeline` 每轮先自动重试最多 20 条 `partial` 配图或引用封面，独立使用默认 3 分钟预算，没有新推文时也会处理，结果在 `asset_retry` 中输出。新推文图片另有默认 5 分钟预算，两者分别通过 `X_KOL_MEDIA_RETRY_BUDGET_SECONDS` 和 `X_KOL_MEDIA_DOWNLOAD_BUDGET_SECONDS` 配置（1–600 秒）。预算耗尽的未尝试记录保留到下轮，不刷新其修订号或更新时间。旧记录可能没有这些可选字段；`assets` 可独立补下载缺失头像和已知地址的失败配图，不重新抓取历史内容。数据库与媒体文件需一起保留，JSON 字段存在不保证文件尚未被手动删除。
+
+认证快照位于监控配置 `verification` 及外层、引用各自的 `author_verification`，含实际作者 `handle`、`verified`、主页 `source_url`、`checked_at` 和可选 `badge_color`、`badge_type`。它是读取时的主页状态，不是历史发帖时的认证证明。成功同步与 `assets` 按账号补缺，成功快照缓存 24 小时；每轮最多 20 位、独立默认 180 秒（`X_KOL_VERIFICATION_BUDGET_SECONDS`），队列统计见 `verification_retry`。失败不推断有无认证，不清除已有确认快照，不改写正文或发送状态。
 
 ### 4.3 虚构数据示意
 
@@ -281,6 +287,7 @@ LIMIT 100;
 | `pipeline` | 一轮连续抓取、审核翻译和发送 | 写内容、处理结果和回执 / 发送 |
 | `init` | 创建缺失的数据库表，不创建数据库 | 建表 / 不发送 |
 | `profiles` | 更新数据库中的名单配置 | 写配置 / 不发送 |
+| `assets --limit 20` | 补下载缺失头像和已知地址的失败配图 | 写媒体元数据与文件 / 不发送 |
 | `sync` | 只读抓取 X 并保存增量 | 写内容、游标、同步历史 / 不发送 |
 | `review` | 直连 DeepSeek，审核翻译并校验后回写 | 写审核和译文 / 不发送 |
 | `review --dry-run` | 只读统计待处理数量，不调用 API | 不写入 / 不发送 |

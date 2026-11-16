@@ -34,6 +34,10 @@ set +a
 
 原始推文、引用推文、媒体和未知字段完整保存在 `payload` JSON 中。引用对象继续使用 `quoted_tweet`，避免迁移丢失既有内容。索引列便于后续扩展查询。数据库时间使用 UTC。
 
+监控账号头像元数据保存在 `xkol_profiles.config.avatar`，更新名单时与未知字段一起保留。外层及引用作者的头像分别保存在 `payload.author_avatar`、`payload.quoted_tweet.author_avatar`，包含明确的作者 `handle` 及图片元数据；非监控作者不写入监控名单。补全时按作者复用文件，并通过推文修订号仅更新头像字段。认证快照使用 `config.verification`、`payload.author_verification` 和 `payload.quoted_tweet.author_verification`，分别绑定实际作者，包含 `handle`、布尔值 `verified`、`checked_at`、主页 `source_url` 和可选 `badge_color`、`badge_type`。读取自己的主页身份区后才确认有无认证，未知值不填；失败保留上一次已确认状态。成功同步与 `assets` 每轮最多处理 20 位认证未知或超过 24 小时的作者，独立使用 `X_KOL_VERIFICATION_BUDGET_SECONDS`（默认 180 秒），输出 `verification_retry`。补全遵循相同锁与修订号校验，不改变正文、审核、译文、游标或发送状态。新推文的 `payload.media_urls`、`media_posters` 保留上游地址，`media[]` 保存图片下载结果；引用媒体位于 `quoted_tweet` 内同名字段。文件保存在私有 `data/media/` 或 `X_KOL_MEDIA_DIR`，数据库仅保存相对路径、来源、校验和与状态，无需变更表结构。数据库和媒体目录应一起保留；代码仓库不保存这些文件。
+
+`profiles` 会尝试下载新增或缺失的监控账号头像；`sync` 在探测新推文前自动重试最多 20 条 `media_status=partial` 的记录（含引用封面，独立默认 3 分钟预算），之后在新增推文入库前下载图片及视频封面（默认 5 分钟预算）。成功抓取后自动补齐最多 20 位外层、引用及监控账号的缺失头像，独立使用 `X_KOL_AVATAR_BUDGET_SECONDS`（默认 180 秒），计数在 `avatar_retry` 中输出。`assets --limit 20` 可独立处理同样的头像及失败配图队列。原文、审核、译文、游标、回执和批次均保留。没有媒体地址的旧记录无法直接补图；头像读取失败不填入其他作者的图片。详情见 README 的头像与推文配图说明。
+
 ## 三个阶段
 
 正式自动调度每 15 分钟执行一次 `.venv/bin/python scripts/run_x_kol_db.py pipeline`，同一轮中依次完成下述三个阶段，不再分别按 00/05/10 分调度。以下命令也可用于单独运维。

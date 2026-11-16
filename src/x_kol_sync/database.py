@@ -73,7 +73,7 @@ def tweets(connection):
         return [(json.loads(r['payload']), r['revision']) for r in c.fetchall()]
 
 
-def insert_tweet(connection, row):
+def insert_tweet(connection, row, *, prepare=None):
     from .sync_x_kols import canonical_ledger_url
     value = dict(row)
     value['url'] = canonical_ledger_url(value['url'])
@@ -82,6 +82,8 @@ def insert_tweet(connection, row):
                   (str(value['id']), value['url']))
         if c.fetchone():
             return False
+        if prepare is not None:
+            value = prepare(value)
         c.execute('INSERT INTO xkol_tweets(tweet_id,url,profile_handle,payload,translation_status,content_policy_version) VALUES(%s,%s,%s,%s,%s,%s)',
                   (str(value['id']), value['url'], value.get('profile','').rstrip('/').split('/')[-1].lower(), encode(value), value.get('translation_status','pending'), value.get('content_policy_version')))
     return True

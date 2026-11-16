@@ -43,6 +43,18 @@ class NormalizeProfileTests(unittest.TestCase):
 
 
 class RecordPreparationTests(unittest.TestCase):
+    def test_media_urls_and_posters_survive_outer_and_quote_normalization(self):
+        media = {'has_media': True, 'media_urls': ['https://pbs.twimg.com/media/example.jpg'],
+                 'media_posters': ['https://pbs.twimg.com/media/example.jpg']}
+        item = dict(id='123', author='example', **media,
+                    quoted_tweet=dict(id='100', author='source', **media))
+        row = MODULE.prepare_records([item], 'example', False)[0]
+        for part in (row, row['quoted_tweet']):
+            self.assertEqual(part['media_urls'], media['media_urls'])
+            self.assertEqual(part['media_posters'], media['media_posters'])
+        csv_row = next(csv.DictReader(io.StringIO(MODULE.render_records([row], 'csv'))))
+        self.assertEqual(json.loads(csv_row['media_urls']), media['media_urls'])
+
     def test_preserves_quote_identity_and_text_separately(self):
         item = {
             "id": "123",
@@ -177,6 +189,8 @@ class CommandTests(unittest.TestCase):
                 "2",
                 "-f",
                 "json",
+                "--window",
+                "background",
             ],
         )
 

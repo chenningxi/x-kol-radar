@@ -52,6 +52,8 @@ def profiles(connection):
         config = json.loads(row['config'])
         result.append(dict(handle=row['handle'], alias=config.get('alias', ''),
                            enabled=bool(config.get('enabled', False)), tweet_count=row['tweet_count']))
+        if 'avatar' in config:
+            result[-1]['avatar'] = config['avatar']
     return result
 
 
@@ -62,9 +64,12 @@ def tweet_page(connection, handle, page=1, page_size=20):
         cursor.execute('SELECT COUNT(*) AS total FROM xkol_tweets WHERE profile_handle=%s', (handle,))
         total = cursor.fetchone()['total']
         cursor.execute(
-            'SELECT tweet_id,url FROM xkol_tweets WHERE profile_handle=%s '
+            'SELECT tweet_id,url,payload FROM xkol_tweets WHERE profile_handle=%s '
             'ORDER BY CAST(tweet_id AS UNSIGNED) DESC LIMIT %s OFFSET %s',
             (handle, page_size, (page - 1) * page_size))
         items = cursor.fetchall()
+    for item in items:
+        if 'payload' in item:
+            item['payload'] = json.loads(item['payload'])
     return dict(handle=handle, page=page, page_size=page_size, total=total,
                 total_pages=(total + page_size - 1) // page_size, items=items)
